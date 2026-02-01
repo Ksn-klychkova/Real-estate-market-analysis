@@ -1,0 +1,227 @@
+-- ЗАДАЧА 1. Время активности объявлений
+-- 1. Фильтруем квартиры по выбросам
+WITH limits AS (
+    SELECT
+        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY total_area) AS total_area_limit,
+        PERCENTILE_DISC(0.99) WITHIN GROUP (ORDER BY rooms) AS rooms_limit,
+        PERCENTILE_DISC(0.99) WITHIN GROUP (ORDER BY balcony) AS balcony_limit,
+        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ceiling_height) AS ceiling_height_limit_h,
+        PERCENTILE_CONT(0.01) WITHIN GROUP (ORDER BY ceiling_height) AS ceiling_height_limit_l
+    FROM real_estate.flats
+),
+-- 2. Фильтрация данных с учетом перцентилей и подготовка
+filtered_ads AS (
+    SELECT 
+        a.id,
+        a.days_exposition,
+        a.last_price,
+        f.total_area,
+        f.rooms,
+        f.balcony,
+        f.ceiling_height,
+        f.floor,
+        c.city,
+        CASE
+            WHEN c.city = 'Санкт-Петербург' THEN 'Санкт-Петербург'
+            ELSE 'ЛенОбл'
+        END AS region,
+        CASE
+            WHEN a.days_exposition <= 30 THEN '1-30 days'
+            WHEN a.days_exposition BETWEEN 31 AND 90 THEN '31-90 days'
+            WHEN a.days_exposition BETWEEN 91 AND 180 THEN '91-180 days'
+            WHEN a.days_exposition >= 181 THEN '181+ days'
+            ELSE 'non category'
+        END AS duration,
+        ROUND((CAST(a.last_price AS numeric) / NULLIF(f.total_area, 0))::numeric, 2) AS price_m2
+    FROM real_estate.advertisement AS a
+    JOIN real_estate.flats AS f USING (id)
+    JOIN real_estate.city AS c USING (city_id)
+    CROSS JOIN limits as l
+    WHERE 
+        f.total_area < l.total_area_limit
+        AND (f.rooms < l.rooms_limit OR f.rooms IS NULL)
+        AND (f.balcony < l.balcony_limit OR f.balcony IS NULL)
+        AND (
+            (f.ceiling_height < l.ceiling_height_limit_h 
+             AND f.ceiling_height > l.ceiling_height_limit_l) 
+            OR f.ceiling_height IS NULL)
+        AND f.total_area > 0),      
+--  запрос с группировкой 
+aggregation_group AS (
+    SELECT
+        duration,
+        region,
+        COUNT(id) AS total_ads,
+        ROUND(AVG(price_m2)::numeric, 2) AS avg_price_m2,
+        ROUND(AVG(total_area)::numeric, 2) AS avg_area,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rooms) AS median_rooms,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY balcony) AS median_balcony,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ceiling_height) AS median_ceiling_height,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY floor) AS median_floor
+    FROM filtered_ads
+    GROUP BY duration, region
+)
+-- Вывод результата с сортировкой
+SELECT
+    duration as Сегмент_активности,
+    region as Регион,
+    total_ads as Количество_объявлений,
+    avg_price_m2 as Ср_стоимость_за_м2,
+    avg_area as Ср_площадь,
+    median_rooms as Медиана_комнат,
+    median_balcony as Медиана_балконы,
+    median_ceiling_height as Медиана_высоты_потолков,
+    median_floor as Медиана_этажей
+FROM aggregation_group
+ORDER BY
+    CASE region
+        WHEN 'Санкт-Петербург' THEN 1
+        ELSE 2
+    END,
+    CASE duration
+        WHEN '1-30 days' THEN 1
+        WHEN '31-90 days' THEN 2
+        WHEN '91-180 days' THEN 3
+        WHEN '181+ days' THEN 4
+        ELSE 5
+    END;
+
+
+
+--Задача 2. Сезонность объявлений
+-- 1. Фильтрация данных по перцентилям (как в первой задаче)
+WITH limits AS (
+    SELECT
+        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY total_area) AS total_area_limit,
+        PERCENTILE_DISC(0.99) WITHIN GROUP (ORDER BY rooms) AS rooms_limit,
+        PERCENTILE_DISC(0.99) WITHIN GROUP (ORDER BY balcony) AS balcony_limit,
+        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ceiling_height) AS ceiling_height_limit_h,
+        PERCENTILE_CONT(0.01) WITHIN GROUP (ORDER BY ceiling_height) AS ceiling_height_limit_l
+    FROM real_estate.flats
+),
+-- 2. Фильтрация данных с учетом перцентилей и подготовка
+filtered_ads AS (
+    SELECT 
+        a.id,
+        a.first_day_exposition,
+        a.days_exposition,
+        a.last_price,
+        f.total_area,
+        c.city,
+        t.type,
+        -- Дата снятия объявления (публикации + дни активности)
+        CASE 
+            WHEN a.days_exposition > 0 THEN 
+                a.first_day_exposition + INTERVAL '1 day' * a.days_exposition
+            ELSE NULL  -- если объявление еще активно
+        END AS removal_date,
+        -- Стоимость за кв. метр (только если данные валидны)
+        CASE 
+            WHEN f.total_area > 0 AND a.last_price > 0 THEN a.last_price / f.total_area
+            ELSE NULL
+        END AS price_per_sqm
+    FROM real_estate.advertisement a
+    JOIN real_estate.flats f ON a.id = f.id
+    JOIN real_estate.city c ON f.city_id = c.city_id
+    JOIN real_estate.type t ON f.type_id = t.type_id
+    WHERE 
+        -- Фильтрация по перцентилям
+        f.total_area < (SELECT total_area_limit FROM limits)
+        -- Только города
+        AND t.type = 'город'
+),
+-- 3. Месяцы размещения и снятия (основные даты)
+month_dates AS (
+    SELECT 
+        -- Месяц размещения
+        EXTRACT(YEAR FROM first_day_exposition) AS pub_year,
+        EXTRACT(MONTH FROM first_day_exposition) AS pub_month,
+        -- Месяц снятия (если есть)
+        EXTRACT(YEAR FROM removal_date) AS rem_year,
+        EXTRACT(MONTH FROM removal_date) AS rem_month,
+        -- Исходные данные
+        id,
+        last_price,
+        total_area,
+        days_exposition,
+        price_per_sqm
+    FROM filtered_ads
+    WHERE first_day_exposition IS NOT NULL
+),
+-- 4. Статистика по месяцам размещения
+publication_stats AS (
+    SELECT 
+        pub_month AS month,
+        'Публикация' AS period_type,
+        -- Правильный расчет метрик: сначала агрегируем все данные за месяц
+        COUNT(*) AS ads_count,
+        -- Средняя цена за кв.метр по всем объявлениям месяца
+        ROUND(AVG(price_per_sqm) FILTER (WHERE price_per_sqm IS NOT NULL)::numeric, 2) AS avg_price_per_sqm,
+        -- Средняя площадь по всем объявлениям месяца
+        ROUND(AVG(total_area) FILTER (WHERE total_area > 0)::numeric, 2) AS avg_total_area,
+        -- Среднее время до снятия
+        ROUND(AVG(days_exposition) FILTER (WHERE days_exposition > 0)::numeric, 2) AS avg_days_exposition,
+        -- Дополнительно: суммарная стоимость
+        SUM(last_price) AS total_price
+    FROM month_dates
+    GROUP BY pub_month
+),
+-- 5. Статистика по месяцам снятия
+removal_stats AS (
+    SELECT 
+        rem_month AS month,
+        'Снятие' AS period_type,
+        COUNT(*) AS ads_count,
+        ROUND(AVG(price_per_sqm) FILTER (WHERE price_per_sqm IS NOT NULL)::numeric, 2) AS avg_price_per_sqm,
+        ROUND(AVG(total_area) FILTER (WHERE total_area > 0)::numeric, 2) AS avg_total_area,
+        ROUND(AVG(days_exposition) FILTER (WHERE days_exposition > 0)::numeric, 2) AS avg_days_exposition,
+        SUM(last_price) AS total_price
+    FROM month_dates
+    WHERE rem_year IS NOT NULL 
+        AND rem_month IS NOT NULL
+        -- Только за анализируемый период
+    GROUP BY rem_month
+),
+-- 6. Объединенная статистика
+combined_stats AS (
+    SELECT * FROM publication_stats
+    UNION ALL
+    SELECT * FROM removal_stats
+),
+-- 7. Дополнительные расчеты (проценты и т.д.)
+monthly_aggregated AS (
+    SELECT 
+        month,
+        period_type,
+        ads_count AS Количество_объявлений,
+        -- Доля от общего количества для каждого типа
+        ROUND(
+            ads_count * 100.0 / SUM(ads_count) OVER (PARTITION BY period_type),
+            2
+        )::numeric AS Доля_от_общего_количества,
+        avg_price_per_sqm AS средняя_стоимость_за_квадратный_метр,
+        avg_total_area AS средняя_площадь,
+        avg_days_exposition AS среднее_время_до_снятия
+    FROM combined_stats
+)
+-- 8. Вывод в горизонтальном формате для сравнения
+SELECT 
+    m.month,
+    -- Публикации
+    COALESCE(p.Количество_объявлений, 0) AS Публикации_количество,
+    COALESCE(p.Доля_от_общего_количества, 0) AS Публикации_доля,
+    COALESCE(p.средняя_стоимость_за_квадратный_метр, 0) AS Публикации_ср_цена_м2,
+    COALESCE(p.средняя_площадь, 0) AS Публикации_ср_площадь,
+    COALESCE(p.среднее_время_до_снятия, 0) AS Публикации_ср_время_продажи, 
+    -- Снятия
+    COALESCE(r.Количество_объявлений, 0) AS Снятия_количество,
+    COALESCE(r.Доля_от_общего_количества, 0) AS Снятия_доля,
+    COALESCE(r.средняя_стоимость_за_квадратный_метр, 0) AS Снятия_ср_цена_м2,
+    COALESCE(r.средняя_площадь, 0) AS Снятия_ср_площадь,
+    COALESCE(r.среднее_время_до_снятия, 0) AS Снятия_ср_время_продажи,
+   -- Разница
+    COALESCE(p.Количество_объявлений, 0) - COALESCE(r.Количество_объявлений, 0) AS Разница_публикации_минус_снятия
+FROM (SELECT generate_series(1, 12) AS month) m
+LEFT JOIN monthly_aggregated p ON m.month = p.month AND p.period_type = 'Публикация'
+LEFT JOIN monthly_aggregated r ON m.month = r.month AND r.period_type = 'Снятие'
+ORDER BY m.month;
